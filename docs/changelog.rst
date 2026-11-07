@@ -21,8 +21,8 @@ possible to scale the thresholds to each participant:
 * The new :py:func:`yasa.sw_amplitude_scale` function measures the amplitude of the slow-wave
   band in each channel: the median depth of all the negative half-waves of the band-pass
   filtered signal whose duration is within ``dur_neg``, without any amplitude criterion. Its
-  documentation describes the workflow, in which the factor of each participant is their scale,
-  computed on a baseline period, divided by the median scale of the study.
+  documentation describes the workflow, in which the factor of each participant is their scale
+  divided by the median scale of the study.
 
 ----------------------------------------------------------------------------------------
 

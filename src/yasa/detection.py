@@ -1942,9 +1942,7 @@ def sw_amplitude_scale(
         Should be omitted if ``data`` is a :py:class:`~mne.io.BaseRaw` instance.
     hypno : array_like or :py:class:`yasa.Hypnogram`
         Sleep stage (hypnogram), as in :py:func:`yasa.sw_detect`. If given, only the half-waves
-        whose negative peak is in the stages defined in ``include`` are used. Any integer array
-        with one value per sample can be used, for example to select the baseline period of a
-        study (see Notes).
+        whose negative peak is in the stages defined in ``include`` are used.
     include : tuple, list or int or str
         Values in ``hypno`` that will be included in the mask. The default is (2, 3), meaning
         N2 and N3 sleep. This has no effect when ``hypno`` is None.
@@ -1977,9 +1975,7 @@ def sw_amplitude_scale(
 
     To detect slow-waves with thresholds scaled to each participant:
 
-    1. Compute the scale of each channel with this function, on a baseline or reference period
-       (e.g. an adaptation night, or the period before an intervention), so that the scale does
-       not depend on the effect under study.
+    1. Compute the scale of each channel of each recording with this function.
     2. Take the median over the channels as the scale of the recording, ``s_i``.
     3. Take the median of ``s_i`` over the recordings of the study as the reference scale,
        ``s_ref``.
@@ -1990,6 +1986,12 @@ def sw_amplitude_scale(
 
     A factor per channel, ``scale / s_ref``, can also be passed to ``amp_scale``, with the
     channels in the same order as in the data.
+
+    ``s_ref`` only sets the overall level of the thresholds: changing it multiplies the factor of
+    every recording by the same constant. With a single recording, ``s_ref = s_i`` and the factor
+    is 1, so the detection is unchanged; with few recordings, the median is imprecise. In both
+    cases, ``s_ref`` can instead be taken from a larger dataset recorded and processed in the same
+    way (montage, reference and filter), since the scale depends on all three.
 
     Examples
     --------
@@ -2004,26 +2006,25 @@ def sw_amplitude_scale(
     CHAN000    50.0
     dtype: float64
 
-    2. Detection with thresholds scaled to each participant, where ``baselines`` and ``nights``
-       are dictionaries of ``(raw, hypnogram)`` per participant, for the baseline period and the
-       night to analyze:
+    2. Detection with thresholds scaled to each participant, where ``recordings`` is a dictionary
+       of ``(raw, hypnogram)`` per participant:
 
     .. code-block:: python
 
         import numpy as np
         import yasa
 
-        # 1-2) Scale of each recording, on the baseline period
+        # 1-2) Scale of each recording
         s_i = {
             sub: yasa.sw_amplitude_scale(raw, hypno=hyp, include=["N2", "N3"]).median()
-            for sub, (raw, hyp) in baselines.items()
+            for sub, (raw, hyp) in recordings.items()
         }
         # 3) Reference scale: median over the recordings
         s_ref = np.median(list(s_i.values()))
         # 4) Detection with the amplitude thresholds scaled to each recording
         sw = {
             sub: yasa.sw_detect(raw, hypno=hyp, include=["N2", "N3"], amp_scale=s_i[sub] / s_ref)
-            for sub, (raw, hyp) in nights.items()
+            for sub, (raw, hyp) in recordings.items()
         }
     """
     (data, sf, ch_names, hypno, include, mask, n_chan, n_samples, bad_chan) = _check_data_hypno(
