@@ -4,6 +4,29 @@ What's new
 ##########
 
 
+v0.8.2 (unreleased)
+-------------------
+
+**Slow-waves detection: amplitude thresholds scaled to each participant**
+
+The amplitude thresholds of :py:func:`yasa.sw_detect` are fixed values in uV, so the number of
+detected slow-waves depends on the overall amplitude of the EEG, which differs between
+participants (for example with age, or with skull and scalp thickness). Two additions make it
+possible to scale the thresholds to each participant:
+
+* :py:func:`yasa.sw_detect` accepts a new ``amp_scale`` argument, a factor (or one factor per
+  channel) that multiplies every amplitude threshold (``amp_neg``, ``amp_pos`` and ``amp_ptp``).
+  This is the same as rescaling the EEG to a common amplitude before the detection, but the
+  slow-wave amplitudes are reported in uV. The default (None) leaves the detection unchanged.
+* The new :py:func:`yasa.sw_amplitude_scale` function measures the amplitude of the slow-wave
+  band in each channel: the median depth of all the negative half-waves of the band-pass
+  filtered signal whose duration is within ``dur_neg``, without any amplitude criterion. Its
+  documentation describes the workflow, in which the factor of each participant is their scale,
+  computed on a baseline period, divided by the median scale of the study.
+
+----------------------------------------------------------------------------------------
+
+
 v0.8.1 (October 2026)
 ---------------------
 

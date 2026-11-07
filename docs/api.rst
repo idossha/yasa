@@ -21,6 +21,7 @@ Automatic sleep staging & events detection
     spindles_detect
     SpindlesResults
     sw_detect
+    sw_amplitude_scale
     SWResults
     compare_detection
 

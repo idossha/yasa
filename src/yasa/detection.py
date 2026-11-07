@@ -43,6 +43,7 @@ __all__ = [
     "spindles_detect",
     "SpindlesResults",
     "sw_detect",
+    "sw_amplitude_scale",
     "SWResults",
     "rem_detect",
     "REMResults",
@@ -1335,6 +1336,20 @@ class SpindlesResults(_DetectionResults):
 #############################################################################
 
 
+def _filter_sw(data, sf, freq_sw):
+    """Band-pass filter of the slow-wave detection (FIR, 0.2 Hz transition bands)."""
+    return filter_data(
+        data,
+        sf,
+        freq_sw[0],
+        freq_sw[1],
+        method="fir",
+        verbose=False,
+        l_trans_bandwidth=0.2,
+        h_trans_bandwidth=0.2,
+    )
+
+
 def _norm_direct_pac(pha, amp, p=0.05):
     """Normalized direct PAC (ndPAC).
 
@@ -1385,6 +1400,7 @@ def sw_detect(
     coupling_params=None,
     remove_outliers=False,
     verbose=False,
+    amp_scale=None,
 ):
     """Slow-waves detection.
 
@@ -1528,6 +1544,21 @@ def sw_detect(
 
         .. versionadded:: 0.2.0
 
+    amp_scale : float, array_like or None
+        Factor by which every amplitude threshold is multiplied: both bounds of ``amp_neg``,
+        ``amp_pos`` and ``amp_ptp``. Can be a positive float, applied to all channels, or an array
+        of positive floats with one value per channel (length *n_chan*). Thresholds set to None
+        or ``np.inf`` are left as is. The default (None) uses the thresholds as given.
+
+        Fixed thresholds in uV make the number of detected slow-waves depend on the overall
+        amplitude of the EEG, which differs between participants (for example with age, or with
+        skull and scalp thickness). Scaling the thresholds by ``amp_scale=k`` is equivalent to
+        dividing the data by ``k`` before the detection, but the slow-wave amplitudes are reported
+        in the original unit. Use :py:func:`yasa.sw_amplitude_scale` to estimate ``k`` for each
+        participant.
+
+        .. versionadded:: 0.8.2
+
     Returns
     -------
     sw : :py:class:`yasa.SWResults`
@@ -1606,6 +1637,14 @@ def sw_detect(
         >>> hyp = yasa.Hypnogram(["W", "N1", "N2", "N2", "N3", "REM"], freq="30s")
         >>> sw = yasa.sw_detect(raw, hypno=hyp, include=["N2", "N3"])  # doctest: +SKIP
 
+    3. Scale the amplitude thresholds to the EEG amplitude of the participant, with a factor
+       computed by :py:func:`yasa.sw_amplitude_scale` (see its documentation for the full
+       workflow across the recordings of a study):
+
+    .. code-block:: python
+
+        >>> sw = yasa.sw_detect(raw, hypno=hyp, amp_scale=1.2)  # doctest: +SKIP
+
     For a full walkthrough, please refer to the tutorial:
     https://github.com/raphaelvallat/yasa/blob/master/notebooks/05_sw_detection.ipynb
     """
@@ -1614,22 +1653,21 @@ def sw_detect(
         data, sf, ch_names, hypno, include, verbose=verbose
     )
 
+    if amp_scale is not None:
+        amp_scale = np.asarray(amp_scale, dtype=np.float64)
+        if amp_scale.ndim not in (0, 1) or amp_scale.size not in (1, n_chan):
+            raise ValueError(f"amp_scale must be a float or an array of length {n_chan}.")
+        if not np.all(np.isfinite(amp_scale) & (amp_scale > 0)):
+            raise ValueError("amp_scale must be positive and finite.")
+        amp_scale = np.broadcast_to(amp_scale, n_chan)
+
     # If all channels are bad
     if sum(bad_chan) == n_chan:
         logger.warning("All channels have bad amplitude. Returning None.")
         return None
 
     # Bandpass filter
-    data_filt = filter_data(
-        data,
-        sf,
-        freq_sw[0],
-        freq_sw[1],
-        method="fir",
-        verbose=False,
-        l_trans_bandwidth=0.2,
-        h_trans_bandwidth=0.2,
-    )
+    data_filt = _filter_sw(data, sf, freq_sw)
 
     # Extract the spindles-related sigma signal for coupling
     if coupling:
@@ -1673,11 +1711,19 @@ def sw_detect(
         if bad_chan[i]:
             continue
 
+        # Amplitude thresholds of the channel, multiplied by amp_scale (None stays None)
+        amp_neg_i, amp_pos_i, amp_ptp_i = amp_neg, amp_pos, amp_ptp
+        if amp_scale is not None:
+            amp_neg_i, amp_pos_i, amp_ptp_i = (
+                tuple(None if b is None else b * amp_scale[i] for b in amp)
+                for amp in (amp_neg, amp_pos, amp_ptp)
+            )
+
         # Find peaks in data
         # Negative peaks with value comprised between -40 to -300 uV
-        idx_neg_peaks, _ = signal.find_peaks(-1 * data_filt[i, :], height=amp_neg)
+        idx_neg_peaks, _ = signal.find_peaks(-1 * data_filt[i, :], height=amp_neg_i)
         # Positive peaks with values comprised between 10 to 200 uV
-        idx_pos_peaks, _ = signal.find_peaks(data_filt[i, :], height=amp_pos)
+        idx_pos_peaks, _ = signal.find_peaks(data_filt[i, :], height=amp_pos_i)
         # Keep only the peaks that are in the sleep stages defined in include
         idx_neg_peaks = idx_neg_peaks[mask[idx_neg_peaks]]
         idx_pos_peaks = idx_pos_peaks[mask[idx_pos_peaks]]
@@ -1701,7 +1747,7 @@ def sw_detect(
         # Now we compute the PTP amplitude and keep only the good peaks
         sw_pt = np.abs(data_filt[i, idx_neg_peaks])
         sw_ptp = sw_pt + data_filt[i, idx_pos_peaks]
-        good_ptp = np.logical_and(sw_ptp > amp_ptp[0], sw_ptp < amp_ptp[1])
+        good_ptp = np.logical_and(sw_ptp > amp_ptp_i[0], sw_ptp < amp_ptp_i[1])
 
         # If good_ptp is all False
         if not good_ptp.any():
@@ -1858,6 +1904,164 @@ def sw_detect(
     return SWResults(
         events=df, data=data, sf=sf, ch_names=ch_names, hypno=hypno, data_filt=data_filt
     )
+
+
+@_restore_log_level
+def sw_amplitude_scale(
+    data,
+    sf=None,
+    ch_names=None,
+    hypno=None,
+    include=(2, 3),
+    freq_sw=(0.3, 1.5),
+    dur_neg=(0.3, 1.5),
+    verbose=False,
+):
+    """Amplitude scale of the slow-wave band, to scale the thresholds of the slow-waves detection.
+
+    The amplitude thresholds of :py:func:`yasa.sw_detect` are fixed values in uV, so the number of
+    detected slow-waves depends on the overall amplitude of the EEG, which differs between
+    participants (for example with age, or with skull and scalp thickness). This function measures
+    that amplitude in each channel, so that the thresholds can be scaled to each participant with
+    the ``amp_scale`` argument of :py:func:`yasa.sw_detect`.
+
+    .. versionadded:: 0.8.2
+
+    Parameters
+    ----------
+    data : array_like or :py:class:`mne.io.BaseRaw`
+        Single or multi-channel data. If ``data`` is *array_like*, unit must be uV and of
+        shape (n_samples) or (n_chan, n_samples). If ``data`` is a :py:class:`~mne.io.BaseRaw`
+        instance, ``data``, ``sf``, and ``ch_names`` will be automatically extracted, and
+        ``data`` will be automatically converted from Volts (MNE) to micro-Volts (YASA).
+    sf : float
+        Sampling frequency of the data in Hz if ``data`` is *array_like*.
+        Should be omitted if ``data`` is a :py:class:`~mne.io.BaseRaw` instance.
+    ch_names : list of str
+        Channel names if ``data`` is *array_like*.
+        Should be omitted if ``data`` is a :py:class:`~mne.io.BaseRaw` instance.
+    hypno : array_like or :py:class:`yasa.Hypnogram`
+        Sleep stage (hypnogram), as in :py:func:`yasa.sw_detect`. If given, only the half-waves
+        whose negative peak is in the stages defined in ``include`` are used. Any integer array
+        with one value per sample can be used, for example to select the baseline period of a
+        study (see Notes).
+    include : tuple, list or int or str
+        Values in ``hypno`` that will be included in the mask. The default is (2, 3), meaning
+        N2 and N3 sleep. This has no effect when ``hypno`` is None.
+    freq_sw : tuple or list
+        Slow wave frequency range. Default is 0.3 to 1.5 Hz. Use the same value as in
+        :py:func:`yasa.sw_detect`.
+    dur_neg : tuple or list
+        The minimum and maximum duration of the negative half-waves. Default is 0.3 to 1.5
+        second. Use the same value as in :py:func:`yasa.sw_detect`.
+    verbose : bool or str
+        Verbose level. Default (False) will only print warning and error messages. The logging
+        levels are 'debug', 'info', 'warning', 'error', and 'critical'.
+
+    Returns
+    -------
+    scale : :py:class:`pandas.Series`
+        Amplitude scale of each channel, in uV, indexed by channel name. It is NaN for a channel
+        without any negative half-wave (a warning is logged) or with bad amplitude.
+
+    Notes
+    -----
+    The data are band-pass filtered in ``freq_sw`` exactly as in :py:func:`yasa.sw_detect`. A
+    candidate is any negative half-wave of the filtered signal, from a positive-to-negative
+    zero-crossing to the next negative-to-positive zero-crossing, whose duration is strictly
+    within ``dur_neg`` (the duration of the negative phase as in :py:func:`yasa.sw_detect`). No
+    amplitude criterion is applied. The depth of a candidate is the absolute value of its negative
+    peak, and the scale of a channel is the median depth of its candidates. The scale is therefore
+    proportional to the amplitude of the data: multiplying the data by a constant multiplies the
+    scale by the same constant.
+
+    To detect slow-waves with thresholds scaled to each participant:
+
+    1. Compute the scale of each channel with this function, on a baseline or reference period
+       (e.g. an adaptation night, or the period before an intervention), so that the scale does
+       not depend on the effect under study.
+    2. Take the median over the channels as the scale of the recording, ``s_i``.
+    3. Take the median of ``s_i`` over the recordings of the study as the reference scale,
+       ``s_ref``.
+    4. Detect the slow-waves of each recording with ``amp_scale=s_i / s_ref``, which multiplies
+       every amplitude threshold of :py:func:`yasa.sw_detect` by this factor. This is the same as
+       rescaling the EEG of each participant to a common amplitude before the detection, and the
+       thresholds as given apply to a recording of median amplitude.
+
+    A factor per channel, ``scale / s_ref``, can also be passed to ``amp_scale``, with the
+    channels in the same order as in the data.
+
+    Examples
+    --------
+    1. Scale of a sine wave of 1 Hz and 50 uV:
+
+    >>> import numpy as np
+    >>> import yasa
+    >>> sf = 100
+    >>> t = np.arange(60 * sf) / sf
+    >>> yasa.sw_amplitude_scale(50 * np.sin(2 * np.pi * t), sf).round(1)
+    Channel
+    CHAN000    50.0
+    dtype: float64
+
+    2. Detection with thresholds scaled to each participant, where ``baselines`` and ``nights``
+       are dictionaries of ``(raw, hypnogram)`` per participant, for the baseline period and the
+       night to analyze:
+
+    .. code-block:: python
+
+        import numpy as np
+        import yasa
+
+        # 1-2) Scale of each recording, on the baseline period
+        s_i = {
+            sub: yasa.sw_amplitude_scale(raw, hypno=hyp, include=["N2", "N3"]).median()
+            for sub, (raw, hyp) in baselines.items()
+        }
+        # 3) Reference scale: median over the recordings
+        s_ref = np.median(list(s_i.values()))
+        # 4) Detection with the amplitude thresholds scaled to each recording
+        sw = {
+            sub: yasa.sw_detect(raw, hypno=hyp, include=["N2", "N3"], amp_scale=s_i[sub] / s_ref)
+            for sub, (raw, hyp) in nights.items()
+        }
+    """
+    (data, sf, ch_names, hypno, include, mask, n_chan, n_samples, bad_chan) = _check_data_hypno(
+        data, sf, ch_names, hypno, include, verbose=verbose
+    )
+    data_filt = _filter_sw(data, sf, freq_sw)
+    scale = np.full(n_chan, np.nan)
+
+    for i in range(n_chan):
+        if bad_chan[i]:
+            continue
+        x = data_filt[i, :]
+        # A negative half-wave runs from a positive-to-negative zero-crossing (the last positive
+        # sample) to the next crossing (the last non-positive sample), as neg_phase_dur in sw_detect
+        zero_crossings = _zerocrossings(x)
+        is_down = x[zero_crossings[:-1]] > 0
+        idx_down = zero_crossings[:-1][is_down]
+        idx_up = zero_crossings[1:][is_down]
+        neg_phase_dur = (idx_up - idx_down) / sf
+        good = np.logical_and(neg_phase_dur > dur_neg[0], neg_phase_dur < dur_neg[1])
+        idx_neg_peaks = np.array(
+            [d + 1 + np.argmin(x[d + 1 : u + 1]) for d, u in zip(idx_down[good], idx_up[good])],
+            dtype=int,
+        )
+        # Keep only the half-waves whose negative peak is in the stages defined in include
+        idx_neg_peaks = idx_neg_peaks[mask[idx_neg_peaks]]
+        if idx_neg_peaks.size == 0:
+            logger.warning("No negative half-waves were found in channel %s.", ch_names[i])
+            continue
+        scale[i] = np.median(-x[idx_neg_peaks])
+        logger.info(
+            "Amplitude scale of %s = %.4f uV (%i half-waves)",
+            ch_names[i],
+            scale[i],
+            idx_neg_peaks.size,
+        )
+
+    return pd.Series(scale, index=pd.Index(ch_names, name="Channel"))
 
 
 class SWResults(_DetectionResults):

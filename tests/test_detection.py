@@ -22,6 +22,7 @@ from yasa.detection import (
     compare_detection,
     rem_detect,
     spindles_detect,
+    sw_amplitude_scale,
     sw_detect,
 )
 from yasa.hypno import Hypnogram
@@ -582,6 +583,143 @@ def test_sw_mne(mne_n2n3):
     # MNE raw + Hypnogram with string include: same as the upsampled integer hypnogram
     sw_hyp = sw_detect(raw, hypno=mne_n2n3.hyp, include=["N3"])
     pd.testing.assert_frame_equal(sw_hyp.summary(), sw.summary())
+
+
+##############################################################################
+# SLOW-WAVES -- SCALED AMPLITUDE THRESHOLDS
+##############################################################################
+
+# Columns of the slow-waves summary that are amplitudes (proportional to the data)
+SW_AMP_COLUMNS = ["ValNegPeak", "ValPosPeak", "PTP", "Slope"]
+
+
+@pytest.fixture(scope="module")
+def sines():
+    """Two minutes of synthetic slow-waves with a known depth, and an N2 then N3 hypnogram.
+
+    First minute (N2): 80 uV sine at 0.5 Hz (negative half-waves of 1 second). Second minute (N3):
+    30 uV sine at 1.25 Hz (negative half-waves of 0.4 second). The troughs fall on samples.
+    """
+    t = np.arange(60 * sf) / sf
+    data = np.r_[80 * np.sin(2 * np.pi * 0.5 * t), 30 * np.sin(2 * np.pi * 1.25 * t)]
+    return SimpleNamespace(data=data, hypno=np.repeat([2, 3], t.size))
+
+
+@pytest.mark.parametrize("amp_scale", [None, 1, [1.0]])
+def test_sw_amp_scale_default(sw_n3, amp_scale):
+    """amp_scale=None or 1 gives the same slow-waves as the default detection."""
+    sw = sw_detect(sw_n3.data, sf, hypno=sw_n3.hypno, amp_scale=amp_scale)
+    pd.testing.assert_frame_equal(
+        sw.summary(), sw_detect(sw_n3.data, sf, hypno=sw_n3.hypno).summary()
+    )
+
+
+@pytest.mark.parametrize("factor", [0.5, 2])
+def test_sw_amp_scale_invariance(sw_n3, factor):
+    """Data multiplied by a factor, with amp_scale=factor: same slow-waves, scaled amplitudes.
+
+    The factors are powers of two, so the filtered data scale exactly.
+    """
+    ref = sw_detect(sw_n3.data, sf, hypno=sw_n3.hypno).summary()
+    scaled = sw_detect(factor * sw_n3.data, sf, hypno=sw_n3.hypno, amp_scale=factor).summary()
+    # Without amp_scale, the fixed thresholds give a different number of slow-waves
+    assert len(sw_detect(factor * sw_n3.data, sf, hypno=sw_n3.hypno).summary()) != len(ref)
+    pd.testing.assert_frame_equal(
+        scaled.drop(columns=SW_AMP_COLUMNS), ref.drop(columns=SW_AMP_COLUMNS)
+    )
+    pd.testing.assert_frame_equal(scaled[SW_AMP_COLUMNS], factor * ref[SW_AMP_COLUMNS])
+
+
+@pytest.mark.parametrize(
+    "bounds, scaled_bounds",
+    [
+        (
+            {"amp_neg": (40, 200), "amp_pos": (10, 150), "amp_ptp": (75, 350)},
+            {"amp_neg": (60, 300), "amp_pos": (15, 225), "amp_ptp": (112.5, 525)},
+        ),
+        (
+            {"amp_neg": (40, None), "amp_pos": [None, 150], "amp_ptp": (75, np.inf)},
+            {"amp_neg": (60, None), "amp_pos": (None, 225), "amp_ptp": (112.5, np.inf)},
+        ),
+    ],
+)
+def test_sw_amp_scale_bounds(sw_n3, bounds, scaled_bounds):
+    """amp_scale=1.5 is the same as multiplying every amplitude bound by 1.5 (None and inf kept)."""
+    sw = sw_detect(sw_n3.data, sf, amp_scale=1.5, **bounds).summary()
+    pd.testing.assert_frame_equal(sw, sw_detect(sw_n3.data, sf, **scaled_bounds).summary())
+    assert len(sw) != len(sw_detect(sw_n3.data, sf, **bounds).summary())
+    assert sw["PTP"].between(*scaled_bounds["amp_ptp"]).all()
+    assert (sw["ValNegPeak"] <= -scaled_bounds["amp_neg"][0]).all()
+
+
+def test_sw_amp_scale_per_channel(sw_n3):
+    """One factor per channel: a channel twice as large with a factor of 2 gives the same waves."""
+    data = np.vstack((sw_n3.data, 2 * sw_n3.data))
+    sw = sw_detect(data, sf, amp_scale=np.array([1, 2])).summary()
+    chan0 = sw[sw["IdxChannel"] == 0].drop(columns=["Channel", "IdxChannel"]).reset_index(drop=True)
+    chan1 = sw[sw["IdxChannel"] == 1].drop(columns=["Channel", "IdxChannel"]).reset_index(drop=True)
+    ref = sw_detect(sw_n3.data, sf).summary().drop(columns=["Channel", "IdxChannel"])
+    pd.testing.assert_frame_equal(chan0, ref)
+    pd.testing.assert_frame_equal(
+        chan1.drop(columns=SW_AMP_COLUMNS), ref.drop(columns=SW_AMP_COLUMNS)
+    )
+    pd.testing.assert_frame_equal(chan1[SW_AMP_COLUMNS], 2 * ref[SW_AMP_COLUMNS])
+
+
+@pytest.mark.parametrize("amp_scale", [0, -1, np.nan, np.inf, [1, 2], [[1]], "a"])
+def test_sw_amp_scale_errors(sw_n3, amp_scale):
+    """amp_scale must be positive and finite, with one value or one value per channel."""
+    with pytest.raises(ValueError):
+        sw_detect(sw_n3.data, sf, amp_scale=amp_scale)
+
+
+def test_sw_amplitude_scale_known_depth(sines):
+    """The scale is the depth of the synthetic half-waves selected by the hypnogram or duration.
+
+    The tolerance (1%) absorbs the gain of the FIR filter and the filter edges.
+    """
+    for include, depth in [(2, 80), (3, 30)]:
+        scale = sw_amplitude_scale(sines.data, sf, hypno=sines.hypno, include=include)
+        np.testing.assert_allclose(scale.iloc[0], depth, rtol=0.01)
+    # dur_neg selects the 1 s or the 0.4 s half-waves
+    np.testing.assert_allclose(
+        sw_amplitude_scale(sines.data, sf, dur_neg=(0.8, 1.5)), 80, rtol=0.01
+    )
+    np.testing.assert_allclose(
+        sw_amplitude_scale(sines.data, sf, dur_neg=(0.3, 0.8)), 30, rtol=0.01
+    )
+
+
+def test_sw_amplitude_scale_no_candidates(sines, caplog):
+    """No half-wave within dur_neg: a warning is logged and the scale is NaN."""
+    with assert_logs(caplog, "WARNING"):
+        scale = sw_amplitude_scale(sines.data, sf, dur_neg=(1.6, 2))
+    assert scale.isna().all()
+
+
+@pytest.mark.parametrize("factor", [0.5, 4])
+def test_sw_amplitude_scale_linear(full, factor, caplog):
+    """The scale is proportional to the data, NaN for a channel with bad amplitude.
+
+    The factors are powers of two, so the filtered data scale exactly. With other factors, the
+    rounding can flip the sign of a filtered sample at ~1e-15 uV and add or remove a half-wave.
+    """
+    with assert_logs(caplog, "ERROR"):  # Channel with bad amplitude
+        scale = sw_amplitude_scale(full.data, sf, full.chan, hypno=full.hypno)
+    assert scale.index.tolist() == full.chan.tolist()
+    assert scale.index.name == "Channel"
+    assert scale.drop("Bad").gt(0).all() and np.isnan(scale["Bad"])
+    scale_factor = sw_amplitude_scale(factor * full.data, sf, full.chan, hypno=full.hypno)
+    pd.testing.assert_series_equal(scale_factor, factor * scale)
+
+
+def test_sw_amplitude_scale_mne(mne_n2n3):
+    """MNE Raw with a Hypnogram and string include, same as the array in uV."""
+    raw = mne_n2n3.raw
+    scale = sw_amplitude_scale(raw, hypno=mne_n2n3.hyp, include=["N3"])
+    data = raw.get_data(units="uV")
+    expected = sw_amplitude_scale(data, raw.info["sfreq"], raw.ch_names, mne_n2n3.hypno, 3)
+    pd.testing.assert_series_equal(scale, expected)
 
 
 ##############################################################################
