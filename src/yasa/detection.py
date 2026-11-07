@@ -1544,18 +1544,18 @@ def sw_detect(
 
         .. versionadded:: 0.2.0
 
-    amp_scale : float, array_like or None
-        Factor by which every amplitude threshold is multiplied: both bounds of ``amp_neg``,
-        ``amp_pos`` and ``amp_ptp``. Can be a positive float, applied to all channels, or an array
-        of positive floats with one value per channel (length *n_chan*). Thresholds set to None
-        or ``np.inf`` are left as is. The default (None) uses the thresholds as given.
+    amp_scale : float or None
+        Positive factor by which every amplitude threshold is multiplied (both bounds of
+        ``amp_neg``, ``amp_pos`` and ``amp_ptp``), the same for all channels, so that the natural
+        differences in amplitude between channels are kept. Thresholds set to None or ``np.inf``
+        are left as is. The default (None) uses the thresholds as given.
 
         Fixed thresholds in uV make the number of detected slow-waves depend on the overall
         amplitude of the EEG, which differs between participants (for example with age, or with
         skull and scalp thickness). Scaling the thresholds by ``amp_scale=k`` is equivalent to
         dividing the data by ``k`` before the detection, but the slow-wave amplitudes are reported
         in the original unit. Use :py:func:`yasa.sw_amplitude_scale` to estimate ``k`` for each
-        participant.
+        recording.
 
         .. versionadded:: 0.8.2
 
@@ -1653,13 +1653,17 @@ def sw_detect(
         data, sf, ch_names, hypno, include, verbose=verbose
     )
 
+    # Multiply every amplitude threshold by amp_scale, the same for all channels (None stays None)
     if amp_scale is not None:
-        amp_scale = np.asarray(amp_scale, dtype=np.float64)
-        if amp_scale.ndim not in (0, 1) or amp_scale.size not in (1, n_chan):
-            raise ValueError(f"amp_scale must be a float or an array of length {n_chan}.")
-        if not np.all(np.isfinite(amp_scale) & (amp_scale > 0)):
+        if isinstance(amp_scale, (str, bytes)) or np.ndim(amp_scale) != 0:
+            raise ValueError("amp_scale must be a single number, applied to all channels.")
+        amp_scale = float(amp_scale)
+        if not (np.isfinite(amp_scale) and amp_scale > 0):
             raise ValueError("amp_scale must be positive and finite.")
-        amp_scale = np.broadcast_to(amp_scale, n_chan)
+        amp_neg, amp_pos, amp_ptp = (
+            tuple(None if b is None else b * amp_scale for b in amp)
+            for amp in (amp_neg, amp_pos, amp_ptp)
+        )
 
     # If all channels are bad
     if sum(bad_chan) == n_chan:
@@ -1711,19 +1715,11 @@ def sw_detect(
         if bad_chan[i]:
             continue
 
-        # Amplitude thresholds of the channel, multiplied by amp_scale (None stays None)
-        amp_neg_i, amp_pos_i, amp_ptp_i = amp_neg, amp_pos, amp_ptp
-        if amp_scale is not None:
-            amp_neg_i, amp_pos_i, amp_ptp_i = (
-                tuple(None if b is None else b * amp_scale[i] for b in amp)
-                for amp in (amp_neg, amp_pos, amp_ptp)
-            )
-
         # Find peaks in data
         # Negative peaks with value comprised between -40 to -300 uV
-        idx_neg_peaks, _ = signal.find_peaks(-1 * data_filt[i, :], height=amp_neg_i)
+        idx_neg_peaks, _ = signal.find_peaks(-1 * data_filt[i, :], height=amp_neg)
         # Positive peaks with values comprised between 10 to 200 uV
-        idx_pos_peaks, _ = signal.find_peaks(data_filt[i, :], height=amp_pos_i)
+        idx_pos_peaks, _ = signal.find_peaks(data_filt[i, :], height=amp_pos)
         # Keep only the peaks that are in the sleep stages defined in include
         idx_neg_peaks = idx_neg_peaks[mask[idx_neg_peaks]]
         idx_pos_peaks = idx_pos_peaks[mask[idx_pos_peaks]]
@@ -1747,7 +1743,7 @@ def sw_detect(
         # Now we compute the PTP amplitude and keep only the good peaks
         sw_pt = np.abs(data_filt[i, idx_neg_peaks])
         sw_ptp = sw_pt + data_filt[i, idx_pos_peaks]
-        good_ptp = np.logical_and(sw_ptp > amp_ptp_i[0], sw_ptp < amp_ptp_i[1])
+        good_ptp = np.logical_and(sw_ptp > amp_ptp[0], sw_ptp < amp_ptp[1])
 
         # If good_ptp is all False
         if not good_ptp.any():
@@ -1917,13 +1913,13 @@ def sw_amplitude_scale(
     dur_neg=(0.3, 1.5),
     verbose=False,
 ):
-    """Amplitude scale of the slow-wave band, to scale the thresholds of the slow-waves detection.
+    """Amplitude scale of the slow-wave band of a recording, to scale the slow-waves thresholds.
 
     The amplitude thresholds of :py:func:`yasa.sw_detect` are fixed values in uV, so the number of
     detected slow-waves depends on the overall amplitude of the EEG, which differs between
     participants (for example with age, or with skull and scalp thickness). This function measures
-    that amplitude in each channel, so that the thresholds can be scaled to each participant with
-    the ``amp_scale`` argument of :py:func:`yasa.sw_detect`.
+    that amplitude for the whole recording, so that the thresholds can be scaled to each
+    participant with the ``amp_scale`` argument of :py:func:`yasa.sw_detect`.
 
     .. versionadded:: 0.8.2
 
@@ -1958,9 +1954,10 @@ def sw_amplitude_scale(
 
     Returns
     -------
-    scale : :py:class:`pandas.Series`
-        Amplitude scale of each channel, in uV, indexed by channel name. It is NaN for a channel
-        without any negative half-wave (a warning is logged) or with bad amplitude.
+    scale : float
+        Amplitude scale of the recording, in uV: the median over channels of each channel's median
+        half-wave depth. Channels with bad amplitude or without any negative half-wave (a warning
+        is logged) are left out. NaN if no channel has a negative half-wave.
 
     Notes
     -----
@@ -1969,23 +1966,20 @@ def sw_amplitude_scale(
     zero-crossing to the next negative-to-positive zero-crossing, whose duration is strictly
     within ``dur_neg`` (the duration of the negative phase as in :py:func:`yasa.sw_detect`). No
     amplitude criterion is applied. The depth of a candidate is the absolute value of its negative
-    peak, and the scale of a channel is the median depth of its candidates. The scale is therefore
-    proportional to the amplitude of the data: multiplying the data by a constant multiplies the
-    scale by the same constant.
+    peak. The scale of a channel is the median depth of its candidates, and the scale of the
+    recording is the median over channels. It is therefore proportional to the amplitude of the
+    data: multiplying the data by a constant multiplies the scale by the same constant. A single
+    scale for the whole recording keeps the natural differences in amplitude between channels.
 
     To detect slow-waves with thresholds scaled to each participant:
 
-    1. Compute the scale of each channel of each recording with this function.
-    2. Take the median over the channels as the scale of the recording, ``s_i``.
-    3. Take the median of ``s_i`` over the recordings of the study as the reference scale,
+    1. Compute the scale of each recording with this function, ``s_i``.
+    2. Take the median of ``s_i`` over the recordings of the study as the reference scale,
        ``s_ref``.
-    4. Detect the slow-waves of each recording with ``amp_scale=s_i / s_ref``, which multiplies
+    3. Detect the slow-waves of each recording with ``amp_scale=s_i / s_ref``, which multiplies
        every amplitude threshold of :py:func:`yasa.sw_detect` by this factor. This is the same as
        rescaling the EEG of each participant to a common amplitude before the detection, and the
        thresholds as given apply to a recording of median amplitude.
-
-    A factor per channel, ``scale / s_ref``, can also be passed to ``amp_scale``, with the
-    channels in the same order as in the data.
 
     ``s_ref`` only sets the overall level of the thresholds: changing it multiplies the factor of
     every recording by the same constant. With a single recording, ``s_ref = s_i`` and the factor
@@ -2001,10 +1995,8 @@ def sw_amplitude_scale(
     >>> import yasa
     >>> sf = 100
     >>> t = np.arange(60 * sf) / sf
-    >>> yasa.sw_amplitude_scale(50 * np.sin(2 * np.pi * t), sf).round(1)
-    Channel
-    CHAN000    50.0
-    dtype: float64
+    >>> round(yasa.sw_amplitude_scale(50 * np.sin(2 * np.pi * t), sf), 1)
+    50.0
 
     2. Detection with thresholds scaled to each participant, where ``recordings`` is a dictionary
        of ``(raw, hypnogram)`` per participant:
@@ -2014,14 +2006,14 @@ def sw_amplitude_scale(
         import numpy as np
         import yasa
 
-        # 1-2) Scale of each recording
+        # 1) Scale of each recording
         s_i = {
-            sub: yasa.sw_amplitude_scale(raw, hypno=hyp, include=["N2", "N3"]).median()
+            sub: yasa.sw_amplitude_scale(raw, hypno=hyp, include=["N2", "N3"])
             for sub, (raw, hyp) in recordings.items()
         }
-        # 3) Reference scale: median over the recordings
+        # 2) Reference scale: median over the recordings
         s_ref = np.median(list(s_i.values()))
-        # 4) Detection with the amplitude thresholds scaled to each recording
+        # 3) Detection with the amplitude thresholds scaled to each recording
         sw = {
             sub: yasa.sw_detect(raw, hypno=hyp, include=["N2", "N3"], amp_scale=s_i[sub] / s_ref)
             for sub, (raw, hyp) in recordings.items()
@@ -2062,7 +2054,10 @@ def sw_amplitude_scale(
             idx_neg_peaks.size,
         )
 
-    return pd.Series(scale, index=pd.Index(ch_names, name="Channel"))
+    if np.isnan(scale).all():
+        logger.warning("No negative half-waves were found in data. Returning NaN.")
+        return np.nan
+    return float(np.nanmedian(scale))
 
 
 class SWResults(_DetectionResults):
